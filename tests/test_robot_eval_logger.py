@@ -114,10 +114,10 @@ def test_both_grippers_are_preserved_losslessly(run_dir):
 
 
 def _arm_joints(dataset):
-    """(component, joint names) for every arm, in the metadata's order."""
+    """(embodiment name, component, joint names) for every arm, in the metadata's order."""
     return [
-        (component, embodiment.joints)
-        for embodiment in dataset.meta.equipment.embodiments.values()
+        (name, component, embodiment.joints)
+        for name, embodiment in dataset.meta.equipment.embodiments.items()
         if embodiment.components and "qpos" in embodiment.attributes
         for component in embodiment.components
     ]
@@ -126,7 +126,7 @@ def _arm_joints(dataset):
 def test_joint_position_excludes_the_gripper_column(run_dir, dataset):
     """qpos is [joint1..joint7, gripper] per arm; only the joints belong here."""
     episode = _load(run_dir / "traj_0.pkl")
-    expected = sum(len(joints) - 1 for _, joints in _arm_joints(dataset))
+    expected = sum(len(joints) - 1 for _, _, joints in _arm_joints(dataset))
     assert episode.joint_position.shape == (episode.episode_length, expected)
 
 
@@ -136,7 +136,7 @@ def test_action_keeps_the_gripper_commands(run_dir, dataset):
     arms = _arm_joints(dataset)
     assert episode.action.shape == (
         episode.episode_length,
-        sum(len(joints) for _, joints in arms),
+        sum(len(joints) for _, _, joints in arms),
     )
     samples = dataset.sample(hz=30, episode=dataset.meta.episodes[0], state="qpos")
     expected = np.asarray(
@@ -144,9 +144,9 @@ def test_action_keeps_the_gripper_commands(run_dir, dataset):
             np.concatenate(
                 [
                     np.asarray(
-                        sample.action[f"arms/{component}/qpos"], dtype=np.float32
+                        sample.action[f"{name}/{component}/qpos"], dtype=np.float32
                     )
-                    for component, _ in arms
+                    for name, component, _ in arms
                 ]
             )
             for sample in samples
