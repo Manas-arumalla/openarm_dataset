@@ -22,9 +22,25 @@ Layout produced, per that project's DATA_FORMAT.md::
         traj_1.pkl
         ...
 
-Each ``traj_{i}.pkl`` is an lz4-frame-compressed pickle of one object whose
-attributes carry the episode. The class identity does not matter to the
-reader, only the attribute names, dtypes and shapes.
+Each ``traj_{i}.pkl`` is an lz4-frame-compressed pickle of one
+``types.SimpleNamespace`` whose attributes carry the episode. The spec says
+only the attribute names, dtypes and shapes matter, and a standard-library
+class lets a reader unpickle it without installing ``openarm_dataset``.
+
+Arms and columns
+----------------
+Arms come from the dataset's equipment metadata: every embodiment with
+``qpos`` and components (OpenArm's ``right`` and ``left``), in the
+metadata's order, which is also the order ``lerobot_v21`` uses. A trailing
+``gripper`` joint is split off only when the metadata names it.
+``joint_position`` (and ``joint_velocity`` / ``joint_effort``) hold the arm
+joints without grippers; ``action`` keeps every commanded value, grippers
+included (``[right joints..., right gripper, left joints..., left gripper]``),
+so it can train or evaluate a policy that drives the grippers. The spec does
+not require ``action`` and ``joint_position`` to share a width.
+
+Embodiments without ``qpos`` and components, such as the cell lifter, are
+not written: the format has no field for them.
 
 Bimanual grippers
 -----------------
@@ -48,6 +64,7 @@ import json
 import os
 import pickle
 import random
+import types
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -60,20 +77,6 @@ ROBOT_TYPE = "openarm"
 # We always emit measured joint angles, so this is the state field the
 # reader will look for.
 CONTROL_MODE = "joint_position"
-
-
-class Episode:
-    """One trajectory, in the attribute layout the reader expects.
-
-    Deliberately a plain container: DATA_FORMAT.md states the class name is
-    irrelevant to loading and only the attributes matter, so pickling a
-    lightweight object avoids making the reader import anything of ours.
-    """
-
-    def __init__(self, **attributes):
-        """Set every given attribute on this episode."""
-        for name, value in attributes.items():
-            setattr(self, name, value)
 
 
 def _require_lz4():
@@ -89,75 +92,68 @@ def _require_lz4():
     return lz4.frame
 
 
-def _components(keys) -> list[str]:
-    """Return the arm components present, in a stable order.
+def _arms(dataset: Dataset) -> list[tuple[str, str, bool]]:
+    """Return ``(embodiment, component, has_gripper)`` for every arm, in metadata order.
 
-    Sample keys look like ``arms/right/qpos``; the component is the middle
-    segment. Sorted so a dataset always converts to the same column order
-    rather than one that depends on dict iteration.
+    An arm is an embodiment that records ``qpos`` per component (OpenArm's
+    ``right`` and ``left``). Following ``lerobot_v21``, a gripper is split
+    off only when the embodiment's last joint is named ``gripper``.
     """
-    found = []
-    for key in keys:
-        parts = key.split("/")
-        if len(parts) == 3 and parts[0] == "arms":
-            if parts[1] not in found:
-                found.append(parts[1])
-    return sorted(found)
+    arms = []
+    for name, embodiment in dataset.meta.equipment.embodiments.items():
+        if not embodiment.components or "qpos" not in embodiment.attributes:
+            continue  # e.g. the cell lifter: no field for it in this format
+        has_gripper = bool(embodiment.joints) and embodiment.joints[-1] == "gripper"
+        for component in embodiment.components:
+            arms.append((name, component, has_gripper))
+    return arms
 
 
-def _split(vector: np.ndarray) -> tuple[np.ndarray, float]:
-    """Split one arm's qpos into (joints, gripper).
+def _stack(samples, attribute: str, suffix: str, arms, keep_grippers: bool):
+    """Stack one per-arm modality across time.
 
-    Per kinematics.py the per-arm convention is ``[joint1..joint7,
-    gripper]``, so the gripper is the trailing element.
+    Returns ``(values, grippers)``: ``values`` concatenates the arms in order,
+    without their trailing gripper unless ``keep_grippers``; ``grippers`` maps
+    each component with a gripper to its per-step gripper values.
     """
-    return vector[:-1], float(vector[-1])
-
-
-def _stack(samples, attribute: str, components: list[str]):
-    """Build (joints, grippers) arrays across time for one modality."""
-    joints_per_step = []
-    grippers_per_step = []
+    rows = []
+    grippers = {component: [] for _, component, has_gripper in arms if has_gripper}
     for sample in samples:
         source = getattr(sample, attribute)
-        joints = []
-        grippers = {}
-        for component in components:
-            vector = np.asarray(source[f"arms/{component}/qpos"], dtype=np.float32)
-            arm_joints, gripper = _split(vector)
-            joints.append(arm_joints)
-            grippers[component] = gripper
-        joints_per_step.append(np.concatenate(joints))
-        grippers_per_step.append(grippers)
+        row = []
+        for name, component, has_gripper in arms:
+            vector = np.asarray(
+                source[f"{name}/{component}/{suffix}"], dtype=np.float32
+            )
+            if has_gripper:
+                grippers[component].append(vector[-1])
+                if not keep_grippers:
+                    vector = vector[:-1]
+            row.append(vector)
+        rows.append(np.concatenate(row))
     return (
-        np.asarray(joints_per_step, dtype=np.float32),
-        grippers_per_step,
+        np.asarray(rows, dtype=np.float32),
+        {
+            component: np.asarray(values, dtype=np.float32).reshape(-1, 1)
+            for component, values in grippers.items()
+        },
     )
 
 
-def _stack_optional(samples, attribute: str, suffix: str, components: list[str]):
+def _stack_optional(samples, attribute: str, suffix: str, arms):
     """Stack an optional per-arm modality, or return None if absent.
 
     The source records ``qvel`` and ``qtorque`` alongside ``qpos``, and the
     target format has optional ``joint_velocity`` and ``joint_effort``
-    fields, so passing them through keeps the conversion lossless. Older
-    datasets may not carry them, hence the None.
+    fields, so passing them through keeps the conversion lossless. Grippers
+    are dropped exactly as in ``joint_position``, so the step-level joint
+    arrays share one width. Older datasets may not carry them, hence None.
     """
     source = getattr(samples[0], attribute)
-    keys = [f"arms/{component}/{suffix}" for component in components]
-    if not all(key in source for key in keys):
+    if not all(f"{name}/{component}/{suffix}" in source for name, component, _ in arms):
         return None
-    rows = []
-    for sample in samples:
-        values = getattr(sample, attribute)
-        # Drop each arm's trailing gripper element, exactly as
-        # joint_position does, so every step-level array shares one D.
-        rows.append(
-            np.concatenate(
-                [np.asarray(values[key], dtype=np.float32)[:-1] for key in keys]
-            )
-        )
-    return np.asarray(rows, dtype=np.float32)
+    values, _ = _stack(samples, attribute, suffix, arms, keep_grippers=False)
+    return values
 
 
 def to_robot_eval_logger(
@@ -197,10 +193,46 @@ def to_robot_eval_logger(
         # must match this value.
         eval_id = random.randrange(10**15, 10**16)
 
+    tasks = dataset.meta.data.get("tasks") or []
+    arms = _arms(dataset)
+    if not arms:
+        raise ValueError(
+            "The equipment metadata declares no arm (an embodiment with 'qpos' "
+            "per component); the robot_eval_logger format needs joint positions."
+        )
+    components = [component for _, component, _ in arms]
+    with_gripper = [component for _, component, has_gripper in arms if has_gripper]
+    if gripper_component is None:
+        if len(with_gripper) > 1:
+            raise ValueError(
+                "This dataset records more than one arm with a gripper "
+                f"({', '.join(with_gripper)}), so which one the required "
+                "'gripper' field refers to is ambiguous. Pass "
+                "gripper_component to choose. Every gripper is written in full as "
+                "'<component>_gripper' regardless."
+            )
+        if not with_gripper:
+            raise ValueError(
+                "No arm in the equipment metadata has a gripper joint, but the "
+                "robot_eval_logger format requires a 'gripper' field."
+            )
+        chosen = with_gripper[0]
+    else:
+        if gripper_component not in components:
+            raise ValueError(
+                f"gripper_component {gripper_component!r} is not in this "
+                f"dataset; available: {', '.join(components)}"
+            )
+        if gripper_component not in with_gripper:
+            raise ValueError(
+                f"gripper_component {gripper_component!r} has no gripper joint; "
+                f"arms with one: {', '.join(with_gripper) or 'none'}"
+            )
+        chosen = gripper_component
+
+    # Only after the arguments check out, so a bad call leaves no empty run.
     run_dir = Path(output) / str(eval_id)
     run_dir.mkdir(parents=True, exist_ok=True)
-
-    tasks = dataset.meta.data.get("tasks") or []
     written = 0
 
     for episode in dataset.meta.episodes:
@@ -213,43 +245,28 @@ def to_robot_eval_logger(
         if not samples:
             continue
 
-        components = _components(samples[0].obs.keys())
-        if not components:
+        missing = [
+            f"{name}/{component}/qpos"
+            for name, component, _ in arms
+            if f"{name}/{component}/qpos" not in samples[0].obs
+        ]
+        if missing:
             raise ValueError(
-                "No 'arms/<component>/qpos' entries in the sampled observations; "
-                "the robot_eval_logger format needs joint positions."
+                f"Episode {episode.get('id', '?')} has no {', '.join(missing)} "
+                "in its sampled observations, though the metadata declares them."
             )
-        if gripper_component is None:
-            if len(components) > 1:
-                raise ValueError(
-                    "This dataset records more than one arm "
-                    f"({', '.join(components)}), so which one the required "
-                    "'gripper' field refers to is ambiguous. Pass "
-                    "gripper_component to choose. Both are written in full as "
-                    "'<component>_gripper' regardless."
-                )
-            chosen = components[0]
-        else:
-            if gripper_component not in components:
-                raise ValueError(
-                    f"gripper_component {gripper_component!r} is not in this "
-                    f"dataset; available: {', '.join(components)}"
-                )
-            chosen = gripper_component
 
-        joint_position, obs_grippers = _stack(samples, "obs", components)
-        action, _ = _stack(samples, "action", components)
+        joint_position, obs_grippers = _stack(
+            samples, "obs", "qpos", arms, keep_grippers=False
+        )
+        # Keep the commanded gripper values: without them the output can't
+        # train or evaluate a policy that drives the grippers.
+        action, _ = _stack(samples, "action", "qpos", arms, keep_grippers=True)
 
         steps = len(samples)
-        gripper = np.asarray(
-            [[obs_grippers[i][chosen]] for i in range(steps)], dtype=np.float32
-        )
+        gripper = obs_grippers[chosen]
         per_component = {
-            f"{component}_gripper": np.asarray(
-                [[obs_grippers[i][component]] for i in range(steps)],
-                dtype=np.float32,
-            )
-            for component in components
+            f"{component}_gripper": values for component, values in obs_grippers.items()
         }
 
         cameras = {
@@ -274,14 +291,14 @@ def to_robot_eval_logger(
 
         timestamps = [sample.timestamp for sample in samples]
         optional = {}
-        joint_velocity = _stack_optional(samples, "obs", "qvel", components)
+        joint_velocity = _stack_optional(samples, "obs", "qvel", arms)
         if joint_velocity is not None:
             optional["joint_velocity"] = joint_velocity
-        joint_effort = _stack_optional(samples, "obs", "qtorque", components)
+        joint_effort = _stack_optional(samples, "obs", "qtorque", arms)
         if joint_effort is not None:
             optional["joint_effort"] = joint_effort
 
-        record = Episode(
+        record = types.SimpleNamespace(
             language_command=language_command,
             success=success,
             episode_length=steps,

@@ -47,7 +47,7 @@ def main():
     )
     parser.add_argument(
         "--fps",
-        help="Frames per second for the output dataset (default: 30) if the output format is lerobot_v2.1, lerobot_v3.0 or gr00t",
+        help="Frames per second for the output dataset (default: 30) if the output format is lerobot_v2.1, lerobot_v3.0, gr00t or robot_eval_logger",
         type=int,
         default=30,
     )
@@ -65,7 +65,7 @@ def main():
     )
     parser.add_argument(
         "--success-only",
-        help="Include only successful episodes in the output dataset (default: False) if the output format is lerobot_v2.1, lerobot_v3.0 or gr00t",
+        help="Include only successful episodes in the output dataset (default: False) if the output format is lerobot_v2.1, lerobot_v3.0, gr00t or robot_eval_logger",
         action="store_true",
         default=False,
     )
@@ -82,6 +82,28 @@ def main():
         "format is robot_eval_logger and the dataset records more than one "
         "arm (e.g. right). Every arm's gripper is written in full as "
         "'<component>_gripper' either way",
+    )
+    parser.add_argument(
+        "--eval-id",
+        help="Run identifier if the output format is robot_eval_logger; also "
+        "the name of the run directory. A positive integer (default: random, "
+        "so every conversion creates a new directory)",
+        type=int,
+    )
+    parser.add_argument(
+        "--eval-name",
+        help="Human-readable run name for metadata.json if the output format "
+        "is robot_eval_logger",
+    )
+    parser.add_argument(
+        "--location",
+        help="Physical location for metadata.json if the output format is "
+        "robot_eval_logger",
+    )
+    parser.add_argument(
+        "--evaluator-name",
+        help="Evaluator name for metadata.json if the output format is "
+        "robot_eval_logger",
     )
     parser.add_argument(
         "--camera-format",
@@ -101,6 +123,23 @@ def main():
     )
 
     args = parser.parse_args()
+    robot_eval_logger_only = {
+        "gripper_component": "--gripper-component",
+        "eval_id": "--eval-id",
+        "eval_name": "--eval-name",
+        "location": "--location",
+        "evaluator_name": "--evaluator-name",
+    }
+    if args.format != "robot_eval_logger":
+        given = [
+            flag
+            for key, flag in robot_eval_logger_only.items()
+            if getattr(args, key) is not None
+        ]
+        if given:
+            parser.error(
+                f"{', '.join(given)} applies only to the robot_eval_logger format"
+            )
     write_kwargs = {"format": args.format, "valid_only": args.valid_only}
     if args.format in ("lerobot_v2.1", "lerobot_v3.0", "gr00t"):
         write_kwargs["fps"] = args.fps
@@ -121,8 +160,11 @@ def main():
             )
         write_kwargs["fps"] = args.fps
         write_kwargs["success_only"] = args.success_only
-        if args.gripper_component is not None:
-            write_kwargs["gripper_component"] = args.gripper_component
+        if args.eval_id is not None and args.eval_id <= 0:
+            parser.error("--eval-id must be a positive integer")
+        for option in robot_eval_logger_only:
+            if getattr(args, option) is not None:
+                write_kwargs[option] = getattr(args, option)
     else:
         if args.state is not None:
             parser.error(

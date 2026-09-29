@@ -56,6 +56,7 @@ def test_bimanual_without_a_choice_raises_rather_than_guessing(dataset, tmp_path
     """
     with pytest.raises(ValueError, match="more than one arm"):
         dataset.write(tmp_path / "out", "robot_eval_logger")
+    assert not (tmp_path / "out").exists(), "a rejected call must not leave a run"
 
 
 def test_unknown_gripper_component_raises(dataset, tmp_path):
@@ -112,16 +113,47 @@ def test_both_grippers_are_preserved_losslessly(run_dir):
     np.testing.assert_array_equal(episode.gripper, episode.right_gripper)
 
 
-def test_joint_position_excludes_the_gripper_column(run_dir):
-    """qpos is [joint1..joint7, gripper]; only the joints belong here."""
+def _arm_joints(dataset):
+    """(component, joint names) for every arm, in the metadata's order."""
+    return [
+        (component, embodiment.joints)
+        for embodiment in dataset.meta.equipment.embodiments.values()
+        if embodiment.components and "qpos" in embodiment.attributes
+        for component in embodiment.components
+    ]
+
+
+def test_joint_position_excludes_the_gripper_column(run_dir, dataset):
+    """qpos is [joint1..joint7, gripper] per arm; only the joints belong here."""
     episode = _load(run_dir / "traj_0.pkl")
-    columns = episode.joint_position.shape[1]
-    assert columns % len(COMPONENTS) == 0, "joint columns must divide evenly"
-    per_arm = columns // len(COMPONENTS)
-    # Whatever the arm's DOF, the trailing gripper must not be among them.
-    assert not np.array_equal(
-        episode.joint_position[:, per_arm - 1 : per_arm], episode.left_gripper
+    expected = sum(len(joints) - 1 for _, joints in _arm_joints(dataset))
+    assert episode.joint_position.shape == (episode.episode_length, expected)
+
+
+def test_action_keeps_the_gripper_commands(run_dir, dataset):
+    """action is every arm's raw commanded qpos, grippers included, in order."""
+    episode = _load(run_dir / "traj_0.pkl")
+    arms = _arm_joints(dataset)
+    assert episode.action.shape == (
+        episode.episode_length,
+        sum(len(joints) for _, joints in arms),
     )
+    samples = dataset.sample(hz=30, episode=dataset.meta.episodes[0], state="qpos")
+    expected = np.asarray(
+        [
+            np.concatenate(
+                [
+                    np.asarray(
+                        sample.action[f"arms/{component}/qpos"], dtype=np.float32
+                    )
+                    for component, _ in arms
+                ]
+            )
+            for sample in samples
+        ],
+        dtype=np.float32,
+    )
+    np.testing.assert_array_equal(episode.action, expected)
 
 
 def test_optional_modalities_are_carried_through(run_dir):
@@ -145,7 +177,7 @@ def test_required_episode_fields_come_from_the_dataset(run_dir, dataset):
     assert episode.language_command in prompts
 
 
-def test_success_only_keeps_fewer_episodes(dataset, tmp_path):
+def test_success_only_keeps_only_successful_episodes(dataset, tmp_path):
     everything = tmp_path / "all"
     successes = tmp_path / "ok"
     dataset.write(everything, "robot_eval_logger", gripper_component="right")
@@ -154,4 +186,92 @@ def test_success_only_keeps_fewer_episodes(dataset, tmp_path):
     )
     n_all = len(list(next(everything.iterdir()).glob("traj_*.pkl")))
     n_ok = len(list(next(successes.iterdir()).glob("traj_*.pkl")))
-    assert n_ok < n_all, "the fixture has a failed episode that should be dropped"
+    episodes = dataset.meta.episodes
+    assert n_all == len(episodes)
+    assert n_ok == sum(1 for episode in episodes if episode.get("success", False))
+
+
+def test_eval_options_reach_the_run_directory_and_metadata(dataset, tmp_path):
+    dataset.write(
+        tmp_path,
+        "robot_eval_logger",
+        gripper_component="right",
+        eval_id=1234567,
+        eval_name="nightly",
+        location="Tokyo",
+        evaluator_name="tester",
+    )
+    metadata = json.loads((tmp_path / "1234567" / "metadata.json").read_text())
+    assert metadata["eval_id"] == 1234567
+    assert metadata["eval_name"] == "nightly"
+    assert metadata["location"] == "Tokyo"
+    assert metadata["evaluator_name"] == "tester"
+
+
+def test_cli_passes_the_eval_options(tmp_path, monkeypatch):
+    from openarm_dataset import convert
+
+    argv = [
+        "openarm-dataset-convert",
+        str(DATASET_PATH),
+        str(tmp_path),
+        "--format",
+        "robot_eval_logger",
+        "--gripper-component",
+        "right",
+        "--eval-id",
+        "42",
+        "--eval-name",
+        "nightly",
+        "--location",
+        "Tokyo",
+        "--evaluator-name",
+        "tester",
+    ]
+    monkeypatch.setattr("sys.argv", argv)
+    convert.main()
+    metadata = json.loads((tmp_path / "42" / "metadata.json").read_text())
+    assert (metadata["eval_id"], metadata["eval_name"]) == (42, "nightly")
+    assert (metadata["location"], metadata["evaluator_name"]) == ("Tokyo", "tester")
+
+
+def test_cli_rejects_eval_options_for_other_formats(tmp_path, monkeypatch):
+    from openarm_dataset import convert
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "openarm-dataset-convert",
+            str(DATASET_PATH),
+            str(tmp_path),
+            "--eval-id",
+            "42",
+        ],
+    )
+    with pytest.raises(SystemExit):
+        convert.main()
+
+
+def test_trajectory_loads_without_openarm_dataset(run_dir, tmp_path):
+    """The reader must not need our package to unpickle a trajectory.
+
+    robot_eval_logger's DATA_FORMAT.md says no knowledge of the producing
+    codebase is required. The subprocess blocks ``openarm_dataset`` outright
+    (installed or not), so a pickled class of ours would fail to load.
+    """
+    import subprocess
+    import sys
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.modules['openarm_dataset'] = None; "
+            "import pickle, lz4.frame; "
+            "episode = pickle.loads(lz4.frame.decompress(open(sys.argv[1], 'rb').read())); "
+            "assert episode.joint_position.ndim == 2",
+            str(run_dir / "traj_0.pkl"),
+        ],
+        check=True,
+        cwd=tmp_path,
+    )
